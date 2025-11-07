@@ -1,7 +1,9 @@
 module AST where
 
-import Data.Map (Map)
-import qualified Data.Map as Map
+import Data.Maybe
+import qualified Data.Map as MP
+
+import qualified Data.Set as ST
 
 {-
 Three useful pieces:
@@ -13,7 +15,7 @@ Three useful pieces:
 data TypeVar =
   RigidVar String | -- Rigid Skolem variable; it cannot be anything other than what it is.
   FlexVar String -- Flexible undetermined variable
-  deriving (Eq)
+  deriving (Eq, Ord)
 
 -- Helper function to get fresh unification variable names.
 {-
@@ -44,43 +46,48 @@ data Type =
   deriving (Eq)
 
 -- Given a type, finds all flexible variables occurring in it.
-fv :: Type -> Set TypeVar
+fv :: Type -> ST.Set TypeVar
 fv t =
   case t of
     List t' -> fv t'
-    Function t1 t2 -> union (fv t1) (fv t2)
-    Product t1 t2 -> union (fv t1) (fv t2)
-    Union t1 t2 -> union (fv t1) (fv t2)
-    TVar (FlexVar _) -> singleton t
-    _ -> empty
+    Function t1 t2 -> fv t1 `ST.union` fv t2
+    Product t1 t2 -> fv t1 `ST.union` fv t2
+    Union t1 t2 -> fv t1 `ST.union` fv t2
+    TVar (FlexVar t1) -> ST.singleton (FlexVar t1)
+    _ -> ST.empty
 
 {-
 To aid the structural analysis of compound types
 (i.e. types that are neither primitive nor flexible) 
 we define auxiliary datatypes, encoding the topmost
-type constructor and the sub-branches.
+type constructor and the sub-types.
 -}
 
 data TypeConstructor =
   LIST | FUNC | PROD | UNION
+  deriving (Eq)
 
 data CompoundType = Compound {
   constructor :: TypeConstructor,
   subtypes :: [Type]
 }
 
+instance Eq CompoundType where
+  c1 == c2 = (constructor c1 == constructor c2) && (length (subtypes c1) == length (subtypes c2))
+
 {-
 If primitive or flexible, returns Nothing;
 otherwise, returns the topmost type constructor
-and sub-branches.
+and sub-types.
 -}
-compoundType :: Type -> Maybe TypeConstructor 
+compoundType :: Type -> Maybe CompoundType
 compoundType t =
   case t of
     List t' -> Just (Compound LIST [t'])
     Function t1 t2 -> Just (Compound FUNC [t1, t2])
     Product t1 t2 -> Just (Compound PROD [t1, t2])
     Union t1 t2 -> Just (Compound UNION [t1, t2])
+    _ -> Nothing
 
 
 {-
@@ -108,6 +115,7 @@ instance Show Type where
       Function t1 t2 -> show t1 ++ " → " ++ show t2
       Product t1 t2 -> show t1 ++ " × " ++ show t2
       Union t1 t2 -> show t1 ++ " ⊔ " ++ show t2
+      TVar t1 -> show t1
 
 
 {-
@@ -124,7 +132,7 @@ tab s = unlines $ map ("  " ++) $ lines s
 applyText :: [String] -> String
 applyText [] = ""
 applyText [x] = "(" ++ x ++ ")"
-applyText (x : xs) = x ++ " " ++ (applyText xs)
+applyText (x : xs) = x ++ " " ++ applyText xs
 
 data ExpressionData =
   App |
@@ -145,7 +153,7 @@ data Expression = Expr ExpressionData [Expression]
 instance Show Expression where
   show (Expr exprData subExps) =
     case exprData of
-      App -> applyText $ Prelude.map show subExps
+      App -> applyText $ map show subExps
       Bool b -> show b
       Num n -> show n
       Var s -> s
@@ -162,7 +170,7 @@ instance Show Expression where
         "(__#" ++ show id ++ " : " ++ show t ++ ")"
       Let s t -> "let (" ++ s ++ " : " ++ show t ++ ") =\n" ++ (tab $ show (subExps !! 0)) ++ "\n"
       LetRec s t -> "letrec (" ++ s ++ " : " ++ show t ++ ") =\n" ++ (tab $ show (subExps !! 0)) ++ "\n"
-      Program -> unlines $ Prelude.map show subExps
+      Program -> unlines $ map show subExps
 
 data PathChoice = PathChoice {
   leftSiblings :: [Expression],
@@ -179,12 +187,12 @@ data ExprZipper = Zipper Expression Location
 
 -- Let's begin by assuming no type polymorphism.
 
-type Context = Map String Type
-type Substitution = Map TypeVar Type
-type ConstraintSet = [(TypeVar, Type)]
+type Context = MP.Map String Type
+type Substitution = MP.Map TypeVar Type
+type ConstraintSet = [(Type, Type)]
 
 emptySubstitution :: Substitution
-emptySubstitution = Map.empty
+emptySubstitution = MP.empty
 
 emptyConstraint :: ConstraintSet
 emptyConstraint = []
@@ -198,11 +206,15 @@ substitute sub t =
       Function t1 t2 -> Function (substitute sub t1) (substitute sub t2)
       Product t1 t2 -> Product (substitute sub t1) (substitute sub t2)
       Union t1 t2 -> Union (substitute sub t1) (substitute sub t2)
-      TVar (FlexVar s) -> fromMaybe t Map.lookup (FlexVar s) sub
+      TVar (FlexVar s) -> fromMaybe t $ MP.lookup (FlexVar s) sub
       _ -> t
 
 substituteCtxt :: Substitution -> Context -> Context
-substituteCtxt sub = Map.map (substitute sub)
+substituteCtxt sub = MP.map (substitute sub)
+
+-- Substitution of constraints
+(-*>) :: Substitution -> ConstraintSet -> ConstraintSet
+sub -*> constraint = map (\(t1, t2) -> (substitute sub t1, substitute sub t2)) constraint
 
 -- Extracts a flexible type variable from
 -- a type exactly when the type is this
@@ -211,41 +223,57 @@ extractFlexible :: Type -> Maybe TypeVar
 extractFlexible (TVar (FlexVar t)) = Just (FlexVar t)
 extractFlexible _ = Nothing
 
--- singleton substitution
+-- Singleton substitution
 (|->) :: TypeVar -> Type -> Substitution
-x |-> t = singleton x t
+x |-> t = MP.singleton x t
 
 
--- composition of substitutions
-(*) :: Substitution -> Substitution -> Substitution
-s1 * s2 =
+-- Composition of substitutions
+(-*-) :: Substitution -> Substitution -> Substitution
+s1 -*- s2 =
   let
-    s2' = map (substitute s1) s2
-    s1' = filterWithKey (\k _ -> not $ k `member` s2) s1
+    s2' = MP.map (substitute s1) s2
+    s1' = MP.filterWithKey (\k _ -> not $ k `MP.member` s2) s1
   in 
-    union s1' s2'
+    MP.union s1' s2'
 
-{-
+{- Take two compound types and create constraints for each sub-type,
+unless the type constructors or the number of sub-type are not the same.
+-}
+zipConstraints :: CompoundType -> CompoundType -> Maybe ConstraintSet
+zipConstraints struct1 struct2 =
+  if struct1 == struct2
+    then
+      Just $ zip (subtypes struct1) (subtypes struct2)
+    else 
+      Nothing
+
 unify :: ConstraintSet -> Maybe Substitution
 unify c =
   case c of
+    -- The empty substitution unifies the empty constraint.
     [] -> Just emptySubstitution
-    (s, t) : c' ->
-      if s == t then unify cs'
-      else 
-        let
-          s' = extractFlexible s
-          t' = extractFlexible t
-        in
-          if isJust s' && not $ (fromJust s') `member` (fv t)
-            then do
-              r1 <- unify (((fromJust s') |-> t) * c')
-              return ( r1 * ((fromJust s') |-> t) )
-          else if isJust t' && not $ (fromJust t') `member` (fv s)
-            then do
-              r2 <- unify (((fromJust t') |-> s) * c')
-              return ( r2 * ((fromJust t') |-> s) )
-          else
-            case
+    (t1, t2) : cs ->
+      if t1 == t2 then unify cs -- Structural equality can be dropped.
+      else
+        case (extractFlexible t1, extractFlexible t2) of
+          (Just t1', _) ->
+            if t1' `ST.member` fv t2
+              then Nothing
+              else do
+                u1 <- unify ((t1' |-> t2) -*> cs)
+                return (u1 -*- (t1' |-> t2))
+          (_, Just t2') ->
+            if t2' `ST.member` fv t1
+              then Nothing
+              else do
+                u2 <- unify ((t2' |-> t1) -*> cs)
+                return (u2 -*- (t2' |-> t1))
+          (Nothing, Nothing) -> -- Whenever neither are flexible nor structurally equal.
+            do
+              struct1 <- compoundType t1
+              struct2 <- compoundType t2
+              zipped <- zipConstraints struct1 struct2
+              unify $ zipped ++ cs
 
--}
+
